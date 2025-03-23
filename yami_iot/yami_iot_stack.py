@@ -1,108 +1,70 @@
-import aws_cdk as cdk
 from aws_cdk import (
     Stack,
-    aws_cognito as cognito,
-    aws_iam as iam,
     aws_lambda as _lambda,
+    aws_cognito as cognito,
+    aws_dynamodb as dynamodb,
+    aws_iam as iam
 )
 from constructs import Construct
 
-
 class YamiIotStack(Stack):
-    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
-        super().__init__(scope, id, **kwargs)
-        users_user_pool = cognito.UserPool(
-            self,
-            "UsersUserPool",
-            user_pool_name="Users-Pool",
-            self_sign_up_enabled=True,
-            sign_in_aliases=cognito.SignInAliases(
-                username=True,
-                email=True
-            ),
-            password_policy=cognito.PasswordPolicy(
-                min_length=8,
-                require_lowercase=True,
-                require_uppercase=True,
-                require_digits=True,
-                require_symbols=True
-            ),
-            # account_recovery=cognito.AccountRecovery.EMAIL_ONLY, # Example if needed
-        )
+    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+        super().__init__(scope, construct_id, **kwargs)
 
-        users_user_pool_client = cognito.UserPoolClient(
-            self,
-            "UsersUserPoolClient",
-            user_pool=users_user_pool,
-            generate_secret=False,
-            supported_identity_providers=[
-                cognito.UserPoolClientIdentityProvider.COGNITO
-            ],
-        )
-
-        admins_user_pool = cognito.UserPool(
-            self,
-            "AdminsUserPool",
-            user_pool_name="Admins-Pool",
-            self_sign_up_enabled=False,  # Typically, admins are invited
-            sign_in_aliases=cognito.SignInAliases(
-                username=True,
-                email=True
-            ),
-            password_policy=cognito.PasswordPolicy(
-                min_length=10,
-                require_lowercase=True,
-                require_uppercase=True,
-                require_digits=True,
-                require_symbols=True
+        # Create DynamoDB table
+        user_table = dynamodb.Table(
+            self, 'UserTable',
+            partition_key=dynamodb.Attribute(
+                name='userId',
+                type=dynamodb.AttributeType.STRING
             )
         )
 
-        admins_user_pool_client = cognito.UserPoolClient(
-            self,
-            "AdminsUserPoolClient",
-            user_pool=admins_user_pool,
-            generate_secret=False,
-            supported_identity_providers=[
-                cognito.UserPoolClientIdentityProvider.COGNITO
-            ],
+        # Create Lambda function
+        user_sync_lambda = _lambda.Function(
+            self, 'UserSyncLambda',
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            handler='handler.handler',
+            code=_lambda.Code.from_asset('lambda'),
+            environment={
+                'USER_TABLE_NAME': user_table.table_name
+            }
         )
 
-        devs_user_pool = cognito.UserPool(
-            self,
-            "DevelopersUserPool",
-            user_pool_name="Developers-Pool",
+        # Grant DynamoDB permissions to Lambda
+        user_table.grant_write_data(user_sync_lambda)
+
+        # Create Cognito User Pool
+        user_pool = cognito.UserPool(
+            self, 'UserPool',
             self_sign_up_enabled=True,
-            sign_in_aliases=cognito.SignInAliases(
-                username=True,
-                email=True
+            auto_verify=cognito.AutoVerifiedAttrs(email=True),
+            standard_attributes=cognito.StandardAttributes(
+                email=cognito.StandardAttribute(required=True),
+                given_name=cognito.StandardAttribute(required=True),
+                family_name=cognito.StandardAttribute(required=True)
             ),
-            password_policy=cognito.PasswordPolicy(
-                min_length=8,
-                require_lowercase=True,
-                require_uppercase=False,
-                require_symbols=False,
-                require_digits=True
+            # Configure the Lambda trigger
+            lambda_triggers=cognito.UserPoolTriggers(
+                post_confirmation=user_sync_lambda
             )
         )
 
-        devs_user_pool_client = cognito.UserPoolClient(
-            self,
-            "DevelopersUserPoolClient",
-            user_pool=devs_user_pool,
-            generate_secret=False,
-            supported_identity_providers=[
-                cognito.UserPoolClientIdentityProvider.COGNITO
-            ],
+        user_pool_client = user_pool.add_client(
+            'UserPoolClient',
+            auth_flows=cognito.AuthFlow(
+                user_password=True,
+                user_srp=True
+            ),
+            prevent_user_existence_errors=True
         )
 
-
-        cdk.Stack.of(self).export_value(
-            users_user_pool.user_pool_arn, name="UsersUserPoolArn"
+        # Grant Cognito permissions to invoke Lambda
+        user_sync_lambda.add_permission(
+            'CognitoInvokeLambda',
+            principal=iam.ServicePrincipal('cognito-idp.amazonaws.com'),
+            source_arn=user_pool.user_pool_arn
         )
-        cdk.Stack.of(self).export_value(
-            admins_user_pool.user_pool_arn, name="AdminsUserPoolArn"
-        )
-        cdk.Stack.of(self).export_value(
-            devs_user_pool.user_pool_arn, name="DevelopersUserPoolArn"
-        )
+        
+        CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
+        CfnOutput(self, "UserPoolClientId", value=user_pool_client.user_pool_client_id)
