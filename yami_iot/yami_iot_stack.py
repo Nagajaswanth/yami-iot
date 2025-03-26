@@ -5,7 +5,8 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_iam as iam,
     aws_apigateway as apigateway,
-    CfnOutput
+    CfnOutput,
+    aws_secretsmanager as secretsmanager
 )
 from constructs import Construct
 
@@ -86,6 +87,14 @@ class YamiIotStack(Stack):
             source_arn=user_pool.user_pool_arn
         )
 
+        lambda_layer = _lambda.LayerVersion(
+            self, 'LambdaLayer',
+            code=_lambda.Code.from_asset('lambda_layer'),
+            compatible_runtimes=[_lambda.Runtime.PYTHON_3_9]
+        )
+
+        my_secret = secretsmanager.Secret.from_secret_name_v2(self, "MySecret", "prod/yami/clientId")
+
         assign_role_lambda = _lambda.Function(
             self, 'AssignRoleLambda',
             runtime=_lambda.Runtime.PYTHON_3_9,
@@ -93,7 +102,8 @@ class YamiIotStack(Stack):
             code=_lambda.Code.from_asset('lambda'),
             environment={
                 'USER_POOL_ID': user_pool.user_pool_id
-            }
+            },
+            layers=[lambda_layer]
         )
 
         # Grant permission to Lambda for Cognito user management
@@ -101,6 +111,13 @@ class YamiIotStack(Stack):
             actions=["cognito-idp:AdminAddUserToGroup"],
             resources=[user_pool.user_pool_arn]
         ))
+        my_secret.grant_read(assign_role_lambda)
+
+        authorizer = apigateway.CognitoUserPoolsAuthorizer(
+            self, "APIAuthorizer",
+            cognito_user_pools=[user_pool]
+        )
+
 
         api = apigateway.RestApi(self, "UserManagementAPI",
             rest_api_name="User Management Service",
@@ -109,7 +126,38 @@ class YamiIotStack(Stack):
 
         # Create API resource for assigning roles
         assign_role_resource = api.root.add_resource("assign-role")
-        assign_role_resource.add_method("POST", apigateway.LambdaIntegration(assign_role_lambda))
+        assign_role_resource.add_method(
+            "POST",
+            apigateway.LambdaIntegration(assign_role_lambda),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+            )
+
+        
+        fetch_users_lambda = _lambda.Function(
+            self, 'FetchUsersLambda',
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            handler='fetch_users.handler',
+            code=_lambda.Code.from_asset('lambda'),
+            environment={
+                'USER_POOL_ID': user_pool.user_pool_id
+            },
+            layers=[lambda_layer]
+        )
+
+        fetch_users_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["cognito-idp:ListUsers", "cognito-idp:ListUsersInGroup"],
+            resources=[user_pool.user_pool_arn]
+        ))
+        my_secret.grant_read(fetch_users_lambda)
+        
+        fetch_users_resource = api.root.add_resource("fetch-users")
+        fetch_users_resource.add_method(
+            "GET",
+            apigateway.LambdaIntegration(fetch_users_lambda),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer
+        )
         
         CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
         CfnOutput(self, "UserPoolClientId", value=user_pool_client.user_pool_client_id)
